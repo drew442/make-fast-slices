@@ -168,7 +168,16 @@ get_ctrl_ids(){
     | awk -F':' '/\[[[:space:]]*[0-9]+\]:/ {gsub(/[[:space:]]/,"",$2); print $2}'
 }
 
-bytes_to_h(){ awk -v b="$1" 'BEGIN{split("B KiB MiB GiB TiB PiB",u," ");s=0;while(b>=1024&&s<5){b/=1024;s++}printf "%.2f %s\n",b,u[s+1] }'; }
+bytes_to_h(){
+  awk -v b="$1" 'BEGIN{
+    split("B KiB MiB GiB TiB PiB", u, " ");
+    sign = (b < 0) ? "-" : "";
+    if (b < 0) b = -b;
+    i = 1;
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    printf "%s%.2f %s\n", sign, b, u[i];
+  }'
+}
 
 nvme_total_bytes(){ nvme id-ctrl -H "$1" 2>/dev/null | awk '/tnvmcap/ {gsub(/[^0-9]/,"",$0); print $0; exit}'; }
 nvme_used_bytes(){
