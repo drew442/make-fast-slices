@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 # make-fast-slices.sh
+#
 # - creates NVMe namespaces for Ceph DB/WAL + CephFS metadata
 # - supports 1+ fast devices, balanced layout
 # - dry-run by default; --apply to execute
@@ -133,8 +134,14 @@ is_nvme(){
   return 1
 }
 get_ctrl_from_ns(){ local d="$1"; [[ "$d" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] && echo "${d%n[0-9]*}" || echo "$d"; }
-require_unused_block(){ local d="$1"; lsblk -no MOUNTPOINT "$d" | grep -q . && die "$d is mounted"; }
-
+require_unused_block() {
+  local d="$1"
+  # If the device has any mountpoint, hard-fail; otherwise explicitly return 0
+  if lsblk -no MOUNTPOINT "$d" | grep -q .; then
+    die "$d is mounted"
+  fi
+  return 0
+}
 # --- parse nsids from nvme-cli 2.8 style "[ 0]:0x1" ---
 list_ns_ids_raw(){
   local ctrl="$1"
