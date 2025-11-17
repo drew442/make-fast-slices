@@ -299,30 +299,54 @@ resolve_ns_path() {
   local ctrl="$1"
   local nsid="$2"
 
-  local desc nguid eui
-  desc="$(nvme ns-descs "$ctrl" -n "$nsid" 2>/dev/null || true)"
-  nguid="$(awk -F': ' '/nguid/ {print $2; exit}' <<<"$desc")"
-  eui="$(awk -F': ' '/eui/ {print $2; exit}' <<<"$desc")"
+  # Some controllers + udev are slow to create /dev/nvmeXnY and by-id links.
+  # Retry a few times, letting udev settle between attempts.
+  local tries=30
 
-  if [[ -n "$nguid" ]]; then
-    if [[ -e "/dev/disk/by-id/nvme-eui.$nguid" ]]; then
-      readlink -f "/dev/disk/by-id/nvme-eui.$nguid"; return 0
+  while (( tries-- > 0 )); do
+    local desc nguid eui
+    desc="$(nvme ns-descs "$ctrl" -n "$nsid" 2>/dev/null || true)"
+    nguid="$(awk -F': ' '/nguid/ {print $2; exit}' <<<"$desc")"
+    eui="$(awk -F': ' '/eui/ {print $2; exit}' <<<"$desc")"
+
+    # Prefer nguid-specific by-id entries first
+    if [[ -n "$nguid" ]]; then
+      if [[ -e "/dev/disk/by-id/nvme-eui.$nguid" ]]; then
+        readlink -f "/dev/disk/by-id/nvme-eui.$nguid"
+        return 0
+      fi
+      if [[ -e "/dev/disk/by-id/nvme-ns-$nguid" ]]; then
+        readlink -f "/dev/disk/by-id/nvme-ns-$nguid"
+        return 0
+      fi
     fi
-    if [[ -e "/dev/disk/by-id/nvme-ns-$nguid" ]]; then
-      readlink -f "/dev/disk/by-id/nvme-ns-$nguid"; return 0
+
+    # Fallback to EUI if present
+    if [[ -n "$eui" ]]; then
+      if [[ -e "/dev/disk/by-id/nvme-eui.$eui" ]]; then
+        readlink -f "/dev/disk/by-id/nvme-eui.$eui"
+        return 0
+      fi
     fi
-  fi
-  if [[ -n "$eui" ]]; then
-    if [[ -e "/dev/disk/by-id/nvme-eui.$eui" ]]; then
-      readlink -f "/dev/disk/by-id/nvme-eui.$eui"; return 0
+
+    # Last-resort: classic /dev/nvmeXnY, where Y == nsid
+    if [[ -e "${ctrl}n${nsid}" ]]; then
+      readlink -f "${ctrl}n${nsid}"
+      return 0
     fi
-  fi
-  if [[ -e "${ctrl}n${nsid}" ]]; then
-    readlink -f "${ctrl}n${nsid}"; return 0
-  fi
-  echo ""
+
+    # Let udev catch up, then try again
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm settle --timeout=3 >/dev/null 2>&1 || true
+    else
+      sleep 0.1
+    fi
+  done
+
+  # If we get here, we still couldn't resolve the path
   return 1
 }
+
 
 # ---------------- inspect fast devices ----------------
 declare -A DEV_KIND NVME_CTRL TOTAL_BYTES BEFORE_USED
@@ -444,7 +468,16 @@ create_nvme_ns(){
 
     attach_ns_safely "$ctrl" "$nsid"
 
+    # give udev a moment to create /dev/nvmeXnY and by-id links
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm settle --timeout=3 >/dev/null 2>&1 || true
+    else
+      sleep 0.1
+    fi
+
+    # find the actual device node for this ns
     path="$(resolve_ns_path "$ctrl" "$nsid" || true)"
+    
     if [[ -z "$path" ]]; then
       die "Created nsid=$nsid on $ctrl but could not resolve device path"
     fi
