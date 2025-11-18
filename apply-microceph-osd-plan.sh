@@ -79,18 +79,28 @@ $APPLY || warn "Running in DRY-RUN mode (no changes will be made). Use --apply t
 
 declare -A USED_REAL
 
-info "Querying existing MicroCeph disks via 'microceph disk list'..."
-while IFS= read -r line; do
-  tmp="$line"
-  while [[ "$tmp" =~ (/dev/[^[:space:]]+) ]]; do
-    dev="${BASH_REMATCH[1]}"
-    real="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
+command -v jq >/dev/null 2>&1 || die "jq is required but not installed (used to parse 'microceph disk list --json')"
+
+info "Querying existing MicroCeph disks via 'microceph disk list --json --host-only'..."
+
+json="$(microceph disk list --json --host-only 2>/dev/null || true)"
+
+if [[ -z "$json" ]]; then
+  warn "microceph disk list --json returned no data; assuming no disks are configured yet."
+else
+  # Extract only ConfiguredDisks[*].path and resolve to the real device node
+  while IFS= read -r cfg_path; do
+    [[ -z "$cfg_path" ]] && continue
+
+    # Resolve symlink (e.g. /dev/disk/by-mfast/meta1 -> /dev/nvme0n1)
+    real="$(readlink -f "$cfg_path" 2>/dev/null || echo "$cfg_path")"
+
     USED_REAL["$real"]=1
-    tmp="${tmp#*${dev}}"
-  done
-done < <(microceph disk list 2>/dev/null || true)
+  done < <(jq -r '.ConfiguredDisks[]?.path // empty' <<<"$json")
+fi
 
 info "Detected ${#USED_REAL[@]} disk(s) already in use by MicroCeph."
+
 
 # -------- process plan --------
 
