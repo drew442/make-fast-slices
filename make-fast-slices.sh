@@ -39,8 +39,9 @@ WIPE_EXISTING_PARTS=false
 
 MAKE_LINKS=true
 LINK_ROOT="/dev/disk/by-mfast"
+UDEV_RULE_FILE="/etc/udev/rules.d/99-mfast.rules"
 
-# NEW: global block size (bytes) for all created namespaces
+
 BLOCK_SIZE=512   # can be set with --block-size 4096
 
 need_cmds=(lsblk awk sed grep tr column)
@@ -208,6 +209,43 @@ next_dev_seq() {
   echo "$cur"
 }
 
+ensure_udev_rule() {
+  local label="$1"
+  local dev="$2"
+
+  # Resolve to the real block device node
+  local real
+  real="$(readlink -f "$dev")"
+  [[ -b "$real" ]] || { warn "ensure_udev_rule: $real is not a block device"; return 0; }
+
+  # Get udev properties
+  local props wwn serial
+  props="$(udevadm info --query=property --name="$real" 2>/dev/null || true)"
+
+  wwn="$(grep '^ID_WWN=' <<<"$props" | head -n1 | cut -d= -f2)"
+  serial="$(grep '^ID_SERIAL=' <<<"$props" | head -n1 | cut -d= -f2)"
+
+  local match
+  if [[ -n "$wwn" ]]; then
+    match="ENV{ID_WWN}==\"$wwn\""
+  elif [[ -n "$serial" ]]; then
+    match="ENV{ID_SERIAL}==\"$serial\""
+  else
+    warn "No ID_WWN or ID_SERIAL for $real; not writing udev rule for label=$label"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$UDEV_RULE_FILE")"
+
+  # Remove any existing rule for this label to avoid duplicates
+  if [[ -f "$UDEV_RULE_FILE" ]]; then
+    sed -i "/by-mfast\/$label\"/d" "$UDEV_RULE_FILE"
+  fi
+
+  echo "SUBSYSTEM==\"block\", $match, SYMLINK+=\"disk/by-mfast/$label\"" >> "$UDEV_RULE_FILE"
+  ok "Updated udev rule for $label ($match -> disk/by-mfast/$label)"
+}
+
 ensure_link() {
   local label="$1"
   local target="$2"
@@ -215,34 +253,38 @@ ensure_link() {
 
   mkdir -p "$LINK_ROOT"
 
-  local real
+  # Resolve to real node
+  local real link_target
   real="$(readlink -f "$target")"
 
-  if [[ "$real" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
-    ln -sfn "$real" "$LINK_ROOT/$label"
-    ok "Link $LINK_ROOT/$label -> $real"
-    return 0
-  fi
+  # 1) If it's already a concrete block node (nvme namespace, partition), that's fine
+  if [[ "$real" =~ ^/dev/nvme[0-9]+n[0-9]+$ || "$real" =~ ^/dev/sd[a-z][0-9]*$ || "$real" =~ ^/dev/nvme[0-9]+p[0-9]+$ ]]; then
+    link_target="$real"
+  else
+    # 2) Try to find a /dev/disk/by-id/ symlink that points to this real node
+    local tgt_id=""
+    for id in /dev/disk/by-id/*; do
+      [[ -e "$id" ]] || continue
+      if [[ "$(readlink -f "$id")" == "$real" ]]; then
+        case "$id" in
+          *nvme-eui.*|*nvme-ns-*) tgt_id="$id"; break ;;
+          *) tgt_id="$id" ;;  # keep as candidate
+        esac
+      fi
+    done
 
-  local tgt_id=""
-  for id in /dev/disk/by-id/*; do
-    [[ -e "$id" ]] || continue
-    if [[ "$(readlink -f "$id")" == "$real" ]]; then
-      case "$id" in
-        *nvme-eui.*|*nvme-ns-*) tgt_id="$id"; break ;;
-        *) tgt_id="$id" ;;
-      esac
+    if [[ -n "$tgt_id" ]]; then
+      link_target="$tgt_id"
+    else
+      link_target="$real"
     fi
-  done
-
-  if [[ -n "$tgt_id" ]]; then
-    ln -sfn "$tgt_id" "$LINK_ROOT/$label"
-    ok "Link $LINK_ROOT/$label -> $(readlink -f "$tgt_id")"
-    return 0
   fi
 
-  ln -sfn "$real" "$LINK_ROOT/$label"
-  ok "Link $LINK_ROOT/$label -> $real"
+  ln -sfn "$link_target" "$LINK_ROOT/$label"
+  ok "Link $LINK_ROOT/$label -> $link_target"
+
+  # Also create/update corresponding udev rule so this persists across reboots
+  ensure_udev_rule "$label" "$link_target"
 }
 
 nvme_create_ns_and_get_nsid(){
@@ -563,6 +605,15 @@ if $APPLY; then
     fa=$(( t>0 ? t - ua : 0 ))
     printf "%s  %s  %s  %s\n" "$dev" "$(bytes_to_h "$t")" "$(bytes_to_h "$ua")" "$(bytes_to_h "$fa")"
   done | column -t
+fi
+
+if $APPLY; then
+  # Reload udev rules so newly written mfast rules take effect immediately
+  if command -v udevadm >/dev/null 2>&1; then
+    info "Reloading udev rules and triggering block devices..."
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=block || true
+  fi
 fi
 
 echo
