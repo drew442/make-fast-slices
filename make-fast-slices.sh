@@ -125,16 +125,29 @@ else
 fi
 
 # ---------------- helpers ----------------
-is_nvme(){
+is_nvme() {
   local d="$1"
   [[ -e "$d" ]] || return 1
-  command -v nvme >/dev/null && nvme id-ctrl "$d" &>/dev/null && return 0
-  if [[ "$d" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
-    local c="${d%n[0-9]*}"
-    nvme id-ctrl "$c" &>/dev/null && return 0
+
+  # Treat canonical NVMe controller/namespace names as NVMe up-front,
+  # regardless of whether nvme-cli is installed.
+  if [[ "$d" =~ ^/dev/nvme[0-9]+$ ]] || [[ "$d" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
+    return 0
   fi
+
+  # Fallback: probe via nvme-cli if available
+  if command -v nvme >/dev/null 2>&1; then
+    if [[ "$d" =~ ^/dev/nvme[0-9]+$ ]]; then
+      nvme id-ctrl "$d" &>/dev/null && return 0
+    elif [[ "$d" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
+      local c="${d%n[0-9]*}"
+      nvme id-ctrl "$c" &>/dev/null && return 0
+    fi
+  fi
+
   return 1
 }
+
 get_ctrl_from_ns(){ local d="$1"; [[ "$d" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] && echo "${d%n[0-9]*}" || echo "$d"; }
 require_unused_block() {
   local d="$1"
@@ -422,51 +435,33 @@ resolve_ns_path() {
 
 
 # ---------------- inspect fast devices ----------------
-declare -A DEV_KIND NVME_CTRL TOTAL_BYTES BEFORE_USED
+declare -A DEV_KIND NVME_CTRL PREF_FLBAS_BYTE PREF_LBA_BYTES TOTAL_BYTES BEFORE_USED
 for dev in "${FAST_DEVS[@]}"; do
   [[ -e "$dev" ]] || die "Fast device $dev not found"
   if is_nvme "$dev"; then
     DEV_KIND["$dev"]="nvme"
     ctrl="$(get_ctrl_from_ns "$dev")"; NVME_CTRL["$dev"]="$ctrl"
 
+    pref="$(detect_pref_flbas_and_lba "$ctrl")"
+    PREF_FLBAS_BYTE["$dev"]="${pref%%:*}"
+    PREF_LBA_BYTES["$dev"]="${pref##*:}"
+    info "$dev preferred create params: FLBAS=${PREF_FLBAS_BYTE[$dev]} LBA=${PREF_LBA_BYTES[$dev]} bytes"
+
     nslist="$(list_ns_ids_raw "$ctrl" | tr '\n' ' ')"
     if [[ -n "$nslist" ]]; then
-      warn "$ctrl has namespaces: $nslist"
-      if $WIPE_EXISTING_NS && $ALLOW_MODIFY_EXISTING_NS; then
-        if $APPLY; then
-          warn "WIPING ALL namespaces on $ctrl"
-          while read -r nsid_raw; do
-            [[ -z "$nsid_raw" ]] && continue
-            nsid_dec="$nsid_raw"; [[ "$nsid_raw" =~ ^0x ]] && nsid_dec=$((16#${nsid_raw#0x}))
-            nvme detach-ns "$ctrl" -n "$nsid_dec" >/dev/null 2>&1 || true
-            nvme delete-ns "$ctrl" -n "$nsid_dec" >/dev/null 2>&1 || true
-          done < <(list_ns_ids_raw "$ctrl")
-        else
-          dry "Would wipe namespaces on $ctrl: $nslist"
-        fi
-      fi
+      ...
     fi
     TOTAL_BYTES["$dev"]="$(nvme_total_bytes "$ctrl" || echo 0)"
-    # for the "used" calc we need *some* lba, use the chosen global one
-    BEFORE_USED["$dev"]="$(nvme_used_bytes "$ctrl" "$BLOCK_SIZE")"
-    info "$dev will create namespaces with block size ${BLOCK_SIZE}B"
+    BEFORE_USED["$dev"]="$(nvme_used_bytes "$ctrl" "${PREF_LBA_BYTES[$dev]}")"
   else
     DEV_KIND["$dev"]="block"
     require_unused_block "$dev"
-    if ! $ALLOW_PARTITION; then warn "Will not write partitions without --allow-partition"; fi
-    if $WIPE_EXISTING_PARTS && $ALLOW_PARTITION; then
-      if $APPLY; then
-        warn "WIPING ALL partitions on $dev"
-        if command -v sgdisk >/dev/null; then sgdisk --zap-all "$dev"; sgdisk -g "$dev"; else sfdisk --delete "$dev" || true; fi
-        partprobe "$dev" || true
-      else
-        dry "Would wipe all partitions on $dev"
-      fi
-    fi
+    ...
     TOTAL_BYTES["$dev"]="$(block_total_bytes "$dev" || echo 0)"
     BEFORE_USED["$dev"]="$(block_used_bytes "$dev" || echo 0)"
   fi
 done
+
 
 # ---------------- build plan ----------------
 PLAN=()
