@@ -210,42 +210,72 @@ next_dev_seq() {
   echo "$cur"
 }
 
-ensure_udev_rule() {
-  local label="$1"
-  local dev="$2"
+ensure_edev_rule() {
+  local label="$1"    # e.g. osd1-cmb, meta2, osd3-db
+  local target="$2"   # real node, e.g. /dev/sdb2 or /dev/nvme0n3
 
-  # Resolve to the real block device node
-  local real
-  real="$(readlink -f "$dev")"
-  [[ -b "$real" ]] || { warn "ensure_udev_rule: $real is not a block device"; return 0; }
+  local rules_dir="/etc/udev/rules.d"
+  local rules_file="$rules_dir/99-mfast.rules"
 
-  # Get udev properties
-  local props wwn serial
-  props="$(udevadm info --query=property --name="$real" 2>/dev/null || true)"
+  mkdir -p "$rules_dir"
 
-  wwn="$(grep '^ID_WWN=' <<<"$props" | head -n1 | cut -d= -f2)"
-  serial="$(grep '^ID_SERIAL=' <<<"$props" | head -n1 | cut -d= -f2)"
-
-  local match
-  if [[ -n "$wwn" ]]; then
-    match="ENV{ID_WWN}==\"$wwn\""
-  elif [[ -n "$serial" ]]; then
-    match="ENV{ID_SERIAL}==\"$serial\""
-  else
-    warn "No ID_WWN or ID_SERIAL for $real; not writing udev rule for label=$label"
+  # Grab udev properties for this node
+  local props
+  if ! props="$(udevadm info --query=property --name="$target" 2>/dev/null)"; then
+    warn "udevadm info failed for $target; not installing udev rule for $label (links won't persist across reboot)"
     return 0
   fi
 
-  mkdir -p "$(dirname "$UDEV_RULE_FILE")"
+  local devtype wwn partlabel
+  devtype="$(sed -n 's/^DEVTYPE=//p' <<<"$props" | head -n1)"
+  wwn="$(sed -n 's/^ID_WWN=//p' <<<"$props" | head -n1)"
+  partlabel="$(sed -n 's/^ID_PART_ENTRY_NAME=//p' <<<"$props" | head -n1)"
 
-  # Remove any existing rule for this label to avoid duplicates
-  if [[ -f "$UDEV_RULE_FILE" ]]; then
-    sed -i "/by-mfast\/$label\"/d" "$UDEV_RULE_FILE"
+  local rule=""
+
+  # --- Case 1: SAS/SATA SSD partitions (what you showed with sdb2/sdc4) ---
+  # Match BOTH the disk WWN and the GPT partition name, so meta1/osd1-cmb/etc
+  # each get their correct slice instead of all collapsing onto the same partition.
+  if [[ "$devtype" == "partition" && -n "$wwn" && -n "$partlabel" ]]; then
+    rule="SUBSYSTEM==\"block\", ENV{DEVTYPE}==\"partition\", ENV{ID_WWN}==\"$wwn\", ENV{ID_PART_ENTRY_NAME}==\"$partlabel\", SYMLINK+=\"disk/by-mfast/$label\""
+
+  # --- Case 2: NVMe namespaces or whole disks (no partition) ---
+  elif [[ "$devtype" == "disk" && -n "$wwn" ]]; then
+    rule="SUBSYSTEM==\"block\", ENV{DEVTYPE}==\"disk\", ENV{ID_WWN}==\"$wwn\", SYMLINK+=\"disk/by-mfast/$label\""
+
+  # --- Fallback: no WWN/partlabel; try to key off a stable by-id symlink ---
+  else
+    local byid=""
+    for id in /dev/disk/by-id/*; do
+      [[ -e "$id" ]] || continue
+      if [[ "$(readlink -f "$id")" == "$target" ]]; then
+        byid="$(basename "$id")"
+        break
+      fi
+    done
+
+    if [[ -n "$byid" ]]; then
+      # DEVLINKS contains a space-separated list of symlinks.
+      # Match on the by-id name as a substring.
+      rule="SUBSYSTEM==\"block\", ENV{DEVLINKS}==\"*${byid}*\", SYMLINK+=\"disk/by-mfast/$label\""
+    else
+      warn "Could not derive stable identifier for $target; skipping udev rule for $label"
+      return 0
+    fi
   fi
 
-  echo "SUBSYSTEM==\"block\", $match, SYMLINK+=\"disk/by-mfast/$label\"" >> "$UDEV_RULE_FILE"
-  ok "Updated udev rule for $label ($match -> disk/by-mfast/$label)"
+  # Avoid duplicate entries
+  if [[ -f "$rules_file" ]] && grep -Fq "$rule" "$rules_file"; then
+    return 0
+  fi
+
+  echo "$rule" >> "$rules_file"
+  ok "Installed udev rule for label $label -> $target"
+
+  # Reload udev so rules are active next boot (and now, on re-trigger)
+  udevadm control --reload >/dev/null 2>&1 || true
 }
+
 
 ensure_link() {
   local label="$1"
