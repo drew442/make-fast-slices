@@ -2,205 +2,213 @@
 set -Eeuo pipefail
 
 # create-microceph-osd-plan.sh
+# - Build an OSD plan for MicroCeph using:
+#   * rotating "data" disks (scsi /dev/disk/by-id/wwn-*)
+#   * fast slices in /dev/disk/by-mfast (osdN-db, osdN-wal, osdN-cmb)
 #
-# Build a MicroCeph OSD plan based on:
-#   - NVMe slices in /dev/disk/by-mfast (osdX-db / osdX-wal)
-#   - Rotating disks from `microceph disk list --json --host-only` (AvailableDisks, Type="scsi")
+# Output:
+#   CSV written to /var/lib/fastmap/microceph-osd-plan.XXXXXX.csv
+#   Columns:
+#     osd_id,data_path,db_path,wal_path,combined_dbwal
 #
-# Output CSV (to stdout or --out file):
-#   osd,rotating,db,wal,combined_dbwal
+# Requirements:
+#   - microceph
+#   - jq
 #
 # Notes:
-#   - Only uses "AvailableDisks" (so anything already configured as an OSD is ignored).
-#   - Rotating disks are always /dev/disk/by-id/wwn-* where Type == "scsi".
-#   - DB/WAL devices are /dev/disk/by-mfast/osdN-db and /dev/disk/by-mfast/osdN-wal if present.
-#   - combined_dbwal is "no" for DB+WAL separate, "yes" if db-only is present and wal is empty.
+#   - Only disks from "AvailableDisks" in `microceph disk list --json --host-only`
+#     are considered for data_path (so existing MicroCeph disks are ignored).
+#   - combined_dbwal = "yes" means db_path == wal_path (osdN-cmb).
+#   - If only osdN-db exists (no wal/db combo slice), combined_dbwal="no"
+#     and wal_path is empty.
+
 OUT_ROOT="/var/lib/fastmap"
 mkdir -p "$OUT_ROOT"
-MAP_CSV="$(mktemp -p "$OUT_ROOT" microceph-osd-plan.XXXXXX.csv)"
-OUT_FILE=""
-MAX_OSDS=0        # 0 = "as many as we can"
-HOST_ONLY=true
+OUT_FILE="$(mktemp -p "$OUT_ROOT" microceph-osd-plan.XXXXXX.csv)"
 
-die(){ echo -e "\e[31m[FATAL]\e[0m $*" >&2; exit 1; }
+FAST_DIR="/dev/disk/by-mfast"
+
+die() { echo -e "\e[31m[FATAL]\e[0m $*" >&2; exit 1; }
 warn(){ echo -e "\e[33m[WARN]\e[0m  $*" >&2; }
 info(){ echo -e "[INFO] $*"; }
 
 usage() {
   cat <<EOF
-Usage: $0 [options]
+Usage: $0
 
-Options:
-  --max-osds N     Limit the number of OSDs to N (default: use all candidates)
-  --no-host-only   Don't pass --host-only to microceph disk list (normally you want host-only)
-  -h, --help       Show this help
+Creates a MicroCeph OSD plan CSV at:
+  $OUT_FILE
 
-Example:
-  $0 --max-osds 5
+CSV columns:
+  osd_id,data_path,db_path,wal_path,combined_dbwal
+
+No options are currently supported.
 EOF
 }
 
-need_cmds=(microceph jq readlink lsblk)
-for c in "${need_cmds[@]}"; do
-  command -v "$c" >/dev/null || die "Missing required command: $c"
-done
-
-# ---------- arg parsing ----------
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --max-osds) MAX_OSDS="${2:?}"; shift ;;
-    --no-host-only) HOST_ONLY=false ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "Unknown option: $1" ;;
-  esac
-  shift
-done
-
-if [[ -n "$MAX_OSDS" && "$MAX_OSDS" -lt 0 ]]; then
-  die "--max-osds must be >= 0"
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
 fi
 
-# ---------- discover microceph disks ----------
-info "Querying MicroCeph disks via 'microceph disk list --json${HOST_ONLY:+ --host-only}'..."
+command -v microceph >/dev/null 2>&1 || die "microceph command not found"
+command -v jq >/dev/null 2>&1 || die "jq command not found"
 
-if $HOST_ONLY; then
-  json_out="$(microceph disk list --json --host-only 2>/dev/null || echo "")"
-else
-  json_out="$(microceph disk list --json 2>/dev/null || echo "")"
-fi
+[[ -d "$FAST_DIR" ]] || warn "$FAST_DIR does not exist; proceeding without fast slices."
 
-[[ -n "$json_out" ]] || die "Failed to get JSON from 'microceph disk list'"
+info "Plan file will be: $OUT_FILE"
 
-# ConfiguredDisks: we don't ever use these as new rotating disks
-declare -a CONFIGURED_PATHS=()
+# -----------------------------------------------------------
+# 1. Query MicroCeph disks (JSON)
+# -----------------------------------------------------------
+
+info "Querying MicroCeph disks via 'microceph disk list --json --host-only'..."
+MC_JSON="$(microceph disk list --json --host-only)"
+
+# Configured disks (for reference; we don't plan to reuse these)
+CONFIGURED_PATHS=()
 while IFS= read -r p; do
   [[ -n "$p" ]] && CONFIGURED_PATHS+=("$p")
-done < <(printf '%s\n' "$json_out" | jq -r '.ConfiguredDisks[].Path // empty')
+done < <(printf '%s\n' "$MC_JSON" | jq -r '.ConfiguredDisks[].Path // empty')
 
-info "Configured MicroCeph disks on this host: ${#CONFIGURED_PATHS[@]}"
+info "Detected ${#CONFIGURED_PATHS[@]} configured disk(s) in MicroCeph on this host."
 
-declare -A USED_PATH USED_REAL
-for p in "${CONFIGURED_PATHS[@]}"; do
-  USED_PATH["$p"]=1
-  real="$(readlink -f "$p" 2>/dev/null || echo "")"
-  [[ -n "$real" ]] && USED_REAL["$real"]=1
-done
-
-# AvailableDisks: these are our candidates
-# We only want:
-#   - Type == "scsi"
-#   - Path matches /dev/disk/by-id/wwn-*
-#   - Not already in USED_REAL / USED_PATH (paranoid, though AvailableDisks should already exclude)
-declare -a ROTATING=()
-while IFS= read -r path; do
-  [[ -z "$path" ]] && continue
-  # sanity: ensure it's a wwn path
-  if [[ "$path" != /dev/disk/by-id/wwn-* ]]; then
-    continue
-  fi
-  real="$(readlink -f "$path" 2>/dev/null || echo "$path")"
-  if [[ -n "${USED_PATH[$path]:-}" || -n "${USED_REAL[$real]:-}" ]]; then
-    info "Skipping rotating disk already configured: $path (real=$real)"
-    continue
-  fi
-  ROTATING+=("$path")
-done < <(printf '%s\n' "$json_out" | jq -r '
-  .AvailableDisks[]
-  | select(.Type == "scsi")
-  | .Path // empty
-')
-
-if ((${#ROTATING[@]} == 0)); then
-  die "No suitable rotating disks found in AvailableDisks (Type=scsi, /dev/disk/by-id/wwn-*)."
-fi
-
-info "Found ${#ROTATING[@]} candidate rotating disk(s) for OSD data."
-
-# ---------- discover DB/WAL slices in /dev/disk/by-mfast ----------
-MF_ROOT="/dev/disk/by-mfast"
-
-if [[ ! -d "$MF_ROOT" ]]; then
-  die "$MF_ROOT does not exist; you need to run make-fast-slices.sh first."
-fi
-
-# Map osd index -> db path / wal path
-declare -A DB_PATH WAL_PATH
-
-# osdX-db
+# Available data disks (Type == "scsi", wwn-* only)
+DATA_DISKS=()
 while IFS= read -r p; do
-  [[ -z "$p" ]] && continue
-  base="$(basename "$p")"   # e.g. osd3-db
-  if [[ "$base" =~ ^osd([0-9]+)-db$ ]]; then
-    idx="${BASH_REMATCH[1]}"
-    DB_PATH["$idx"]="$p"
-  fi
-done < <(find "$MF_ROOT" -maxdepth 1 -type l -name 'osd*-db' 2>/dev/null | sort -V)
+  [[ -n "$p" ]] && DATA_DISKS+=("$p")
+done < <(printf '%s\n' "$MC_JSON" \
+  | jq -r '.AvailableDisks[]
+           | select(.Type=="scsi")
+           | .Path
+           | select(startswith("/dev/disk/by-id/wwn-"))')
 
-# osdX-wal
-while IFS= read -r p; do
-  [[ -z "$p" ]] && continue
-  base="$(basename "$p")"   # e.g. osd3-wal
-  if [[ "$base" =~ ^osd([0-9]+)-wal$ ]]; then
-    idx="${BASH_REMATCH[1]}"
-    WAL_PATH["$idx"]="$p"
-  fi
-done < <(find "$MF_ROOT" -maxdepth 1 -type l -name 'osd*-wal' 2>/dev/null | sort -V)
+if ((${#DATA_DISKS[@]} == 0)); then
+  warn "No available scsi /dev/disk/by-id/wwn-* disks found in MicroCeph output."
+  warn "Plan will be empty."
+fi
 
-# Count max index we have DB/WAL slices for
-max_idx=0
-for k in "${!DB_PATH[@]}"; do
-  (( k > max_idx )) && max_idx="$k"
+# Sort data disks for deterministic OSD assignment
+if ((${#DATA_DISKS[@]} > 0)); then
+  mapfile -t DATA_DISKS < <(printf '%s\n' "${DATA_DISKS[@]}" | sort)
+fi
+
+info "Found ${#DATA_DISKS[@]} candidate data disk(s) for OSDs."
+
+# -----------------------------------------------------------
+# 2. Discover fast slices in /dev/disk/by-mfast
+# -----------------------------------------------------------
+
+declare -A OSD_DB OSD_WAL OSD_CMB
+
+if [[ -d "$FAST_DIR" ]]; then
+  shopt -s nullglob
+  for link in "$FAST_DIR"/osd*-*; do
+    name="$(basename "$link")"
+    case "$name" in
+      osd*-db)
+        if [[ "$name" =~ ^osd([0-9]+)-db$ ]]; then
+          osd_id="${BASH_REMATCH[1]}"
+          OSD_DB["$osd_id"]="$(readlink -f "$link")"
+        fi
+        ;;
+      osd*-wal)
+        if [[ "$name" =~ ^osd([0-9]+)-wal$ ]]; then
+          osd_id="${BASH_REMATCH[1]}"
+          OSD_WAL["$osd_id"]="$(readlink -f "$link")"
+        fi
+        ;;
+      osd*-cmb)
+        if [[ "$name" =~ ^osd([0-9]+)-cmb$ ]]; then
+          osd_id="${BASH_REMATCH[1]}"
+          OSD_CMB["$osd_id"]="$(readlink -f "$link")"
+        fi
+        ;;
+      *)
+        # ignore meta*, other labels
+        ;;
+    esac
+  done
+  shopt -u nullglob
+fi
+
+# Determine max OSD index implied by fast slices
+max_osd_id=0
+
+for k in "${!OSD_DB[@]}"; do
+  (( k > max_osd_id )) && max_osd_id="$k"
 done
-for k in "${!WAL_PATH[@]}"; do
-  (( k > max_idx )) && max_idx="$k"
+for k in "${!OSD_WAL[@]}"; do
+  (( k > max_osd_id )) && max_osd_id="$k"
 done
-
-if (( max_idx == 0 )); then
-  warn "No osdX-db/osdX-wal labels found in $MF_ROOT; DB/WAL columns will be empty."
-fi
-
-# Number of OSDs we *can* plan for is limited by both rotating disks and index range.
-max_osds_by_rot=${#ROTATING[@]}
-max_osds=$max_osds_by_rot
-if (( max_idx > 0 && max_idx < max_osds )); then
-  max_osds="$max_idx"
-fi
-if (( MAX_OSDS > 0 && MAX_OSDS < max_osds )); then
-  max_osds="$MAX_OSDS"
-fi
-
-if (( max_osds == 0 )); then
-  die "Nothing to plan: no overlapping rotating disks and DB/WAL labels, and/or --max-osds=0."
-fi
-
-info "Planning for up to ${max_osds} OSD(s)."
-
-# ---------- emit CSV plan ----------
-if [[ -n "$OUT_FILE" ]]; then
-  exec >"$OUT_FILE"
-fi
-
-echo "osd,rotating,db,wal,combined_dbwal"
-
-for ((i=1; i<=max_osds; i++)); do
-  # rotating disk for this OSD
-  # Use round-robin over ROTATING (in case more NVMe slices than HDDs / or vice versa)
-  rot="${ROTATING[$(( (i-1) % ${#ROTATING[@]} ))]}"
-
-  db="${DB_PATH[$i]:-}"
-  wal="${WAL_PATH[$i]:-}"
-
-  combined="no"
-  # if we have a DB slice but no WAL slice, mark combined=yes (DB-only)
-  if [[ -n "$db" && -z "$wal" ]]; then
-    combined="yes"
-  fi
-
-  echo "osd${i},${rot},${db},${wal},${combined}"
+for k in "${!OSD_CMB[@]}"; do
+  (( k > max_osd_id )) && max_osd_id="$k"
 done
 
-if [[ -n "$OUT_FILE" ]]; then
-  info "Plan written to $OUT_FILE"
-else
-  info "Plan written to stdout"
+# We will not create more OSDs than we have data disks
+if ((${#DATA_DISKS[@]} < max_osd_id)); then
+  max_osd_id=${#DATA_DISKS[@]}
 fi
+
+if ((max_osd_id == 0)); then
+  info "No OSD indices found from fast slices; plan will only use data disks if any."
+  max_osd_id=${#DATA_DISKS[@]}
+fi
+
+if ((max_osd_id == 0)); then
+  warn "No OSDs can be planned (no data disks and no fast slices)."
+fi
+
+info "Planning OSDs for indices 1..${max_osd_id}"
+
+# -----------------------------------------------------------
+# 3. Write CSV plan
+# -----------------------------------------------------------
+
+{
+  echo "osd_id,data_path,db_path,wal_path,combined_dbwal"
+
+  for ((osd=1; osd<=max_osd_id; osd++)); do
+    # Data disk for this OSD (0-based index into DATA_DISKS)
+    data_path=""
+    if (( osd <= ${#DATA_DISKS[@]} )); then
+      data_path="${DATA_DISKS[$((osd-1))]}"
+    fi
+
+    db_path=""
+    wal_path=""
+    combined="no"
+
+    # Priority:
+    # 1. combined slice (osdN-cmb)
+    # 2. separate db + wal (osdN-db, osdN-wal)
+    # 3. db only (no wal)
+    if [[ -n "${OSD_CMB[$osd]:-}" ]]; then
+      db_path="${OSD_CMB[$osd]}"
+      wal_path="${OSD_CMB[$osd]}"
+      combined="yes"
+    else
+      if [[ -n "${OSD_DB[$osd]:-}" ]]; then
+        db_path="${OSD_DB[$osd]}"
+      fi
+      if [[ -n "${OSD_WAL[$osd]:-}" ]]; then
+        wal_path="${OSD_WAL[$osd]}"
+      fi
+    fi
+
+    # If we have no data_path and no fast path at all, skip row
+    if [[ -z "$data_path" && -z "$db_path" && -z "$wal_path" ]]; then
+      continue
+    fi
+
+    echo "${osd},${data_path},${db_path},${wal_path},${combined}"
+  done
+
+} > "$OUT_FILE"
+
+info "Plan written to: $OUT_FILE"
+echo
+echo "Preview:"
+echo "------------------------------------------------------------"
+column -t -s, "$OUT_FILE" || cat "$OUT_FILE"
+echo "------------------------------------------------------------"
