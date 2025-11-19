@@ -210,7 +210,7 @@ next_dev_seq() {
   echo "$cur"
 }
 
-ensure_edev_rule() {
+ensure_vdev_rule() {
   local label="$1"    # e.g. osd1-cmb, meta2, osd3-db
   local target="$2"   # real node, e.g. /dev/sdb2 or /dev/nvme0n3
 
