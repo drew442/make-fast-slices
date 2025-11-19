@@ -41,6 +41,7 @@ MAKE_LINKS=true
 LINK_ROOT="/dev/disk/by-mfast"
 UDEV_RULE_FILE="/etc/udev/rules.d/99-mfast.rules"
 
+MAP_ROOT="/var/lib/fastmap"
 
 BLOCK_SIZE=512   # can be set with --block-size 4096
 
@@ -481,7 +482,8 @@ for dev in "${FAST_DEVS[@]}"; do
   printf "%s  %s  %s  %s  %s\n" "$dev" "$(bytes_to_h "$t")" "$(bytes_to_h "$u")" "$(bytes_to_h "$a")" "$(bytes_to_h "$fa")"
 done | column -t
 
-MAP_CSV="$(mktemp -t fastmap.XXXXXX).csv"
+mkdir -p "$MAP_ROOT"
+MAP_CSV="$(mktemp -p "$MAP_ROOT" fastmap.XXXXXX.csv)"
 echo "object_path,object_type,for_osd,label,size_gib,backend,backend_id" > "$MAP_CSV"
 
 # --- creators ---
