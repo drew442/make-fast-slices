@@ -457,16 +457,37 @@ for dev in "${FAST_DEVS[@]}"; do
     PREF_LBA_BYTES["$dev"]="${pref##*:}"
     info "$dev preferred create params: FLBAS=${PREF_FLBAS_BYTE[$dev]} LBA=${PREF_LBA_BYTES[$dev]} bytes"
 
-    nslist="$(list_ns_ids_raw "$ctrl" | tr '\n' ' ')"
     if [[ -n "$nslist" ]]; then
-      ...
+      warn "$ctrl has namespaces: $nslist"
+      if $WIPE_EXISTING_NS && $ALLOW_MODIFY_EXISTING_NS; then
+        if $APPLY; then
+          warn "WIPING ALL namespaces on $ctrl"
+          while read -r nsid_raw; do
+            [[ -z "$nsid_raw" ]] && continue
+            nsid_dec="$nsid_raw"; [[ "$nsid_raw" =~ ^0x ]] && nsid_dec=$((16#${nsid_raw#0x}))
+            nvme detach-ns "$ctrl" -n "$nsid_dec" >/dev/null 2>&1 || true
+            nvme delete-ns "$ctrl" -n "$nsid_dec" >/dev/null 2>&1 || true
+          done < <(list_ns_ids_raw "$ctrl")
+        else
+          dry "Would wipe namespaces on $ctrl: $nslist"
+        fi
+      fi
     fi
     TOTAL_BYTES["$dev"]="$(nvme_total_bytes "$ctrl" || echo 0)"
     BEFORE_USED["$dev"]="$(nvme_used_bytes "$ctrl" "${PREF_LBA_BYTES[$dev]}")"
   else
     DEV_KIND["$dev"]="block"
     require_unused_block "$dev"
-    ...
+    if ! $ALLOW_PARTITION; then warn "Will not write partitions without --allow-partition"; fi
+    if $WIPE_EXISTING_PARTS && $ALLOW_PARTITION; then
+      if $APPLY; then
+        warn "WIPING ALL partitions on $dev"
+        if command -v sgdisk >/dev/null; then sgdisk --zap-all "$dev"; sgdisk -g "$dev"; else sfdisk --delete "$dev" || true; fi
+        partprobe "$dev" || true
+      else
+        dry "Would wipe all partitions on $dev"
+      fi
+    fi
     TOTAL_BYTES["$dev"]="$(block_total_bytes "$dev" || echo 0)"
     BEFORE_USED["$dev"]="$(block_used_bytes "$dev" || echo 0)"
   fi
