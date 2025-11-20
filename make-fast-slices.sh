@@ -432,7 +432,17 @@ resolve_ns_path() {
   # If we get here, we still couldn't resolve the path
   return 1
 }
-
+# For historical reasons the script still calls detect_pref_flbas_and_lba()
+# to get "flbas_hex:lba_bytes". We now always create namespaces with a
+# specific block size (default 512B), so we don't need to inspect existing
+# namespaces for preferred FLBAS. This stub keeps the rest of the code happy
+# and centralises the default.
+detect_pref_flbas_and_lba() {
+  local ctrl="$1"
+  # FLBAS byte 0x00 and 512-byte LBA as a sane default for newly-created
+  # namespaces. Callers split on ":" into PREF_FLBAS_BYTE and PREF_LBA_BYTES.
+  echo "0x00:512"
+}
 
 # ---------------- inspect fast devices ----------------
 declare -A DEV_KIND NVME_CTRL PREF_FLBAS_BYTE PREF_LBA_BYTES TOTAL_BYTES BEFORE_USED
