@@ -30,12 +30,20 @@ set -Eeuo pipefail
 #   osd2,/dev/disk/by-id/wwn-...,/dev/disk/by-mfast/osd2-cmb,none,yes
 #
 # Behaviour:
-#   - One rotating disk is allocated per OSD ID (osd1, osd2, ...), in sorted order.
+#   - One rotating disk is allocated per OSD ID (osd1, osd2, ...).
 #   - If osdN-cmb exists, we set combined_dbwal=yes and use that path in the "db" column,
 #     with "wal" set to "none".
 #   - If separate osdN-db/osdN-wal exist, we set combined_dbwal=no and fill db/wal columns.
 #   - If only db *or* wal exists, we set the other to "none" and combined_dbwal=no.
-#   - If there are fewer rotating disks than OSD IDs, we fail.
+#
+#   - Let:
+#       N_fast = number of OSD fast-slice sets (unique osdN with any of -db/-wal/-cmb)
+#       N_rot  = number of eligible rotating disks (scsi, not already configured)
+#
+#     * If N_rot == 0      → FATAL (no data disks to plan).
+#     * If N_rot > N_fast  → FATAL: not enough fast slices for the rotating disks.
+#     * If N_fast > N_rot  → PLAN FOR FIRST N_rot OSD IDs ONLY (sorted numeric),
+#                            and WARN listing osdN that are currently unused.
 #
 # Requirements:
 #   - bash 4+
@@ -78,6 +86,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# ------------- prerequisite checks -------------
 need_cmds=(microceph jq readlink basename sort mkdir mktemp)
 for c in "${need_cmds[@]}"; do
   command -v "$c" >/dev/null || die "Missing required command: $c"
@@ -94,7 +103,6 @@ info "Scanning fast slices in $FAST_DIR ..."
 
 shopt -s nullglob
 for link in "$FAST_DIR"/osd*-*; do
-  # only consider symlinks / files; skip weird entries
   [[ -e "$link" ]] || continue
 
   name="$(basename "$link")"
@@ -191,9 +199,35 @@ for p in "${ROTATING_CANDIDATES[@]}"; do
   echo "  - $p"
 done
 
-# Ensure we have enough rotating disks to cover all OSD IDs
-if [[ ${#ROTATING_CANDIDATES[@]} -lt ${#OSD_IDS[@]} ]]; then
-  die "Not enough rotating disks (${#ROTATING_CANDIDATES[@]}) for OSDs (${#OSD_IDS[@]})."
+n_fast=${#OSD_IDS[@]}
+n_rot=${#ROTATING_CANDIDATES[@]}
+
+info "Fast OSD sets (osdN-*): ${n_fast}, rotating data disks: ${n_rot}"
+
+# If there are more rotating disks than fast sets -> hard error.
+if (( n_rot > n_fast )); then
+  die "You have ${n_rot} rotating disks but only ${n_fast} OSD fast-slice sets (osdN-*). Add more fast slices (osdN-db/wal/cmb) or reduce rotating disks for this plan."
+fi
+
+# We will only plan for max_osds = n_rot (since n_rot <= n_fast here).
+max_osds=$n_rot
+
+# If there are more fast OSD sets than rotating disks, warn and list unused OSD IDs.
+if (( n_fast > n_rot )); then
+  warn "You have ${n_fast} OSD fast-slice sets but only ${n_rot} rotating disks."
+  warn "The plan will be generated ONLY for the first ${max_osds} OSD IDs (sorted numeric)."
+  if (( max_osds < n_fast )); then
+    # Determine which OSD IDs are unused in this plan.
+    unused_ids=()
+    for idx in "${!OSD_IDS[@]}"; do
+      if (( idx >= max_osds )); then
+        unused_ids+=( "${OSD_IDS[$idx]}" )
+      fi
+    done
+    if ((${#unused_ids[@]} > 0)); then
+      warn "Fast slices for the following OSD IDs will NOT be used in this plan (for now): osd${unused_ids[*]}"
+    fi
+  fi
 fi
 
 # ------------- prepare output file -------------
@@ -206,17 +240,12 @@ info "Writing plan to: $PLAN_FILE"
 echo "osd,rotating,db,wal,combined_dbwal" > "$PLAN_FILE"
 
 # ------------- build plan rows -------------
-rot_idx=0
-
-for osd_id in "${OSD_IDS[@]}"; do
+# We only iterate over the first max_osds OSD IDs.
+for (( idx=0; idx<max_osds; idx++ )); do
+  osd_id="${OSD_IDS[$idx]}"
   osd_label="osd${osd_id}"
 
-  # assign rotating disk
-  if [[ $rot_idx -ge ${#ROTATING_CANDIDATES[@]} ]]; then
-    die "Internal error: ran out of rotating disks while assigning OSDs."
-  fi
-  rotating="${ROTATING_CANDIDATES[$rot_idx]}"
-  rot_idx=$((rot_idx + 1))
+  rotating="${ROTATING_CANDIDATES[$idx]}"
 
   db_path="${OSD_DB[$osd_id]:-}"
   wal_path="${OSD_WAL[$osd_id]:-}"
@@ -235,14 +264,13 @@ for osd_id in "${OSD_IDS[@]}"; do
     combined="no"
   fi
 
-  # CSV-safe: our paths shouldn't contain commas, so we can write directly.
   echo "${osd_label},${rotating},${db_path},${wal_path},${combined}" >> "$PLAN_FILE"
 done
 
 echo
 info "Plan generation complete."
 echo "Plan file: $PLAN_FILE"
-echo "You can inspect it with e.g.:"
+echo "You can inspect it with for example:"
 echo "  column -t -s, \"$PLAN_FILE\""
 echo
 echo "Apply on this host with (example):"
