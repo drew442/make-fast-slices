@@ -25,6 +25,12 @@ for i in $(seq 1 180); do
   sleep 5
 done
 
+# Extend to use +85%FREE space in vg0
+lvextend -l +85%FREE vg0/root
+
+# Extend the filesystem (assumes ext4)
+resize2fs /dev/vg0/root
+
 # Final state
-lvs -o lv_name,lv_attr,devices,copy_percent --noheadings vg0
-echo "lvconvert to RAID1 complete."
+lvs -o lv_name,sizelv_attr,devices,copy_percent vg0
+echo "lvconvert to RAID1 and lvextend +85%FREE complete."
