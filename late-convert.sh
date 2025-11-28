@@ -32,5 +32,5 @@ lvextend -l +85%FREE vg0/root
 resize2fs /dev/vg0/root
 
 # Final state
-lvs -o lv_name,sizelv_attr,devices,copy_percent vg0
+lvs -o lv_name,size,lv_attr,devices,copy_percent vg0
 echo "lvconvert to RAID1 and lvextend +85%FREE complete."
